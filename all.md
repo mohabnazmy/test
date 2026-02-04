@@ -93,7 +93,7 @@ In healthcare, session and deduplication must be **patient-scoped** because:
 |-----------------|--------------|---------|-------------|
 | Handle fax + voice intake | **Intake Orchestrator** | OCR, ASR, normalize to text, extract patient hints (Phase 1), full entity extraction (Phase 2) | Classify intent, resolve patient identity, hold session state |
 | Identify which patient | **Patient Finder** | Resolve patient_id from hints EARLY in flow; return verified ID or candidate set | Hold session state, deduplicate, classify intent |
-| Prevent duplicate requests | **Communication Agent** | Open patient-scoped session; deduplicate by `(patient_id, content_hash)`; classify intent | Resolve patient identity; create tasks |
+| Prevent duplicate requests | **Communication Agent** | Open patient-scoped session; deduplicate by `(patient_id, content_hash)`; classify intent; send outbound notifications | Resolve patient identity; create tasks |
 | Classify what's needed | **Action Synthesizer** | Extract domain + action + details | Route, triage, or execute |
 | Prioritize urgency | **Smart Triage** | Apply STAT/URGENT/ROUTINE rules; determine queue assignment | Execute tasks, create tasks, deduplicate |
 | Track task SLA | **Task Enforcer** | Create task, set SLA, monitor, alert on breach | Classify urgency, deduplicate |
@@ -855,14 +855,17 @@ Concierge is an **orchestration and safety layer**, not a new system of record. 
 erDiagram
     INTAKE_SESSION ||--o{ INTAKE_REQUEST : contains
     INTAKE_SESSION ||--o{ ORCHESTRATION_EVENT : logs
+    INTAKE_SESSION ||--o{ COMMUNICATION_MESSAGE : sends
     INTAKE_REQUEST ||--o| TASK : triggers
     INTAKE_REQUEST ||--o{ ORCHESTRATION_EVENT : logs
     TASK ||--o| AI_HANDOFF : has
+    TASK ||--o{ COMMUNICATION_MESSAGE : notifies
     
     INTAKE_SESSION {
         uuid session_id PK
         uuid patient_id
         string channel
+        string channel_identifier
         string patient_status
         json candidate_set
         float identity_confidence
@@ -879,6 +882,20 @@ erDiagram
         json extracted_entities
         uuid task_id
         timestamp received_at
+    }
+    
+    COMMUNICATION_MESSAGE {
+        uuid message_id PK
+        uuid session_id FK
+        uuid task_id
+        string direction
+        string channel
+        string recipient_identifier
+        json content
+        string delivery_status
+        string error_reason
+        timestamp sent_at
+        timestamp delivered_at
     }
     
     ORCHESTRATION_EVENT {
@@ -923,22 +940,26 @@ erDiagram
 - Identity-first session scoping
 - Patient verification status (VERIFIED vs UNVERIFIED)
 - Candidate set for ambiguous identity resolution
-- Channel tracking
+- Channel tracking + reply address
 
 **What it does NOT own:**
 - Patient master data (references `patient_id` only)
 - Task lifecycle or status
 - SLA enforcement
 
-| Field | Description |
-|-------|-------------|
-| `session_id` | Primary key |
-| `patient_id` | Reference to existing patient record (not owned) |
-| `channel` | fax, phone, sms, email, portal |
-| `patient_status` | VERIFIED (≥ 0.95) or UNVERIFIED |
-| `candidate_set` | Ambiguous patient matches for human resolution |
-| `identity_confidence` | Patient Finder confidence score |
-| `opened_at` / `closed_at` | Session lifecycle |
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | uuid | Primary key |
+| `patient_id` | uuid | Reference to existing patient record (not owned) |
+| `channel` | enum | SMS, EMAIL, FAX, PHONE, PORTAL |
+| `channel_identifier` | string | Reply address: phone number, email, fax number, user_id |
+| `patient_status` | enum | VERIFIED (≥ 0.95) or UNVERIFIED |
+| `candidate_set` | json | Ambiguous patient matches for human resolution |
+| `identity_confidence` | float | Patient Finder confidence score |
+| `opened_at` | timestamp | Session start |
+| `closed_at` | timestamp | Session end |
+
+**Why `channel_identifier`:** Enables Communication Agent to send replies (confirmations, status updates) back to the original sender via the same channel they used to contact us.
 
 ---
 
@@ -954,16 +975,49 @@ erDiagram
 - Task creation (triggers only; Tasks platform creates)
 - Task status or lifecycle
 
-| Field | Description |
-|-------|-------------|
-| `request_id` | Primary key |
-| `session_id` | FK to INTAKE_SESSION |
-| `content_hash` | SHA-256 for dedup key: `(patient_id, content_hash)` |
-| `intent` | NEW_REQUEST, STATUS_CHECK, CLARIFICATION, CANCEL, CALLBACK |
-| `raw_input` | Original message (immutable) |
-| `extracted_entities` | Phase 2 LLM output |
-| `task_id` | Reference to TASK if NEW_REQUEST created one |
-| `received_at` | Timestamp |
+| Field | Type | Description |
+|-------|------|-------------|
+| `request_id` | uuid | Primary key |
+| `session_id` | uuid | FK to INTAKE_SESSION |
+| `content_hash` | string | SHA-256 for dedup key: `(patient_id, content_hash)` |
+| `intent` | enum | NEW_REQUEST, STATUS_CHECK, CLARIFICATION, CANCEL, CALLBACK |
+| `raw_input` | json | Original message (immutable) |
+| `extracted_entities` | json | Phase 2 LLM output |
+| `task_id` | uuid | Reference to TASK if NEW_REQUEST created one |
+| `received_at` | timestamp | When message arrived |
+
+---
+
+#### COMMUNICATION_MESSAGE
+
+**What it owns:**
+- Record of all outbound communications (confirmations, status updates, notifications)
+- Delivery tracking (queued → sent → delivered → failed)
+- Audit trail for patient notifications
+
+**What it does NOT own:**
+- Inbound message storage (INTAKE_REQUEST owns that)
+- Task lifecycle
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `message_id` | uuid | Primary key |
+| `session_id` | uuid | FK to INTAKE_SESSION |
+| `task_id` | uuid | FK to TASK (nullable — some messages are session-level) |
+| `direction` | enum | INBOUND, OUTBOUND |
+| `channel` | enum | SMS, EMAIL, FAX, PORTAL, PHONE |
+| `recipient_identifier` | string | Phone number, email address, fax number, user_id |
+| `content` | json | Message body, subject, attachments |
+| `delivery_status` | enum | QUEUED, SENT, DELIVERED, FAILED |
+| `error_reason` | string | Nullable — failure reason if FAILED |
+| `sent_at` | timestamp | When message was dispatched |
+| `delivered_at` | timestamp | Nullable — when delivery confirmed |
+
+**Why this table:**
+- Communication Agent is bidirectional (inbound + outbound)
+- Tracks delivery status for patient notifications
+- Enables retry logic for failed deliveries
+- Provides audit trail for compliance ("did we notify the patient?")
 
 ---
 
@@ -1047,6 +1101,8 @@ erDiagram
 | Intent classification | **Concierge** | INTAKE_REQUEST.intent |
 | AI orchestration audit | **Concierge** | ORCHESTRATION_EVENT |
 | AI safety handoff | **Concierge** | AI_HANDOFF |
+| Patient notifications | **Concierge** | COMMUNICATION_MESSAGE |
+| Delivery tracking | **Concierge** | COMMUNICATION_MESSAGE.delivery_status |
 
 ---
 
@@ -1085,14 +1141,23 @@ erDiagram
 - context_snapshot captures AI state for review
 - Unique constraint ensures one handoff per task—no ping-pong
 
+### How Patient Notifications Are Traced
+
+- COMMUNICATION_MESSAGE logs every outbound message
+- `delivery_status` tracks QUEUED → SENT → DELIVERED → FAILED
+- `channel_identifier` proves correct recipient
+- `error_reason` documents delivery failures
+- Enables compliance answer: "Did we notify the patient? When? Via what channel?"
+
 ### How a Regulator Reconstructs an AI Decision
 
 ```
-INTAKE_SESSION (identity verification)
+INTAKE_SESSION (identity verification + channel_identifier)
   → INTAKE_REQUEST (original message + intent)
     → ORCHESTRATION_EVENT (all AI decisions + QP verdicts)
       → TASK (execution outcome via Tasks platform)
         → AI_HANDOFF (if escalated)
+        → COMMUNICATION_MESSAGE (patient notifications)
 ```
 
 Every decision point has a timestamp, actor, and payload. Chain of custody is unbroken.
@@ -1118,7 +1183,7 @@ Every decision point has a timestamp, actor, and payload. Chain of custody is un
 |-------|----------------|------------------|
 | **Intake Orchestrator** | Text extraction, patient hints, entity extraction | No |
 | **Patient Finder** | Identity resolution | Yes |
-| **Communication Agent** | Session, dedup, intent, messaging | No |
+| **Communication Agent** | Session, dedup, intent, outbound messaging, delivery tracking | No |
 | **Brain** | Orchestration, dispatch, react to verdicts | No |
 | **Action Synthesizer** | Domain + action classification | Yes |
 | **Smart Triage** | Urgency + queue assignment | Yes |
