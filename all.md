@@ -853,18 +853,18 @@ Concierge is an **orchestration and safety layer**, not a new system of record. 
 
 ```mermaid
 erDiagram
-    INTAKE_SESSION ||--o{ INTAKE_REQUEST : "contains"
-    INTAKE_SESSION ||--o{ ORCHESTRATION_EVENT : "logs"
-    INTAKE_REQUEST ||--o| TASK : "triggers (NEW_REQUEST only)"
-    INTAKE_REQUEST ||--o{ ORCHESTRATION_EVENT : "logs"
-    TASK ||--o| AI_HANDOFF : "may have"
+    INTAKE_SESSION ||--o{ INTAKE_REQUEST : contains
+    INTAKE_SESSION ||--o{ ORCHESTRATION_EVENT : logs
+    INTAKE_REQUEST ||--o| TASK : triggers
+    INTAKE_REQUEST ||--o{ ORCHESTRATION_EVENT : logs
+    TASK ||--o| AI_HANDOFF : has
     
     INTAKE_SESSION {
         uuid session_id PK
-        uuid patient_id FK_reference
+        uuid patient_id
         string channel
-        enum patient_status
-        jsonb candidate_set
+        string patient_status
+        json candidate_set
         float identity_confidence
         timestamp opened_at
         timestamp closed_at
@@ -874,10 +874,10 @@ erDiagram
         uuid request_id PK
         uuid session_id FK
         string content_hash
-        enum intent
-        jsonb raw_input
-        jsonb extracted_entities
-        uuid task_id FK_reference
+        string intent
+        json raw_input
+        json extracted_entities
+        uuid task_id
         timestamp received_at
     }
     
@@ -885,19 +885,19 @@ erDiagram
         uuid event_id PK
         uuid session_id FK
         uuid request_id FK
-        uuid task_id FK_reference
-        enum event_type
+        uuid task_id
+        string event_type
         string actor
-        jsonb payload
-        enum qp_verdict
+        json payload
+        string qp_verdict
         timestamp occurred_at
     }
     
     AI_HANDOFF {
         uuid handoff_id PK
-        uuid task_id FK_reference
-        enum reason
-        jsonb context_snapshot
+        uuid task_id UK
+        string reason
+        json context_snapshot
         string handoff_actor
         timestamp handed_off_at
     }
@@ -905,11 +905,13 @@ erDiagram
     TASK {
         uuid task_id PK
         uuid patient_id FK
-        enum status
+        string status
         string assigned_queue
         timestamp sla_deadline
     }
 ```
+
+**Note:** TASK table is owned by existing Tasks platform. Concierge references it, does not create it.
 
 ---
 
