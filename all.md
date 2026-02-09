@@ -1,6 +1,6 @@
 # AllCare.ai Concierge — Product ↔ Technology Architecture
 
-**Version:** 1.4  
+**Version:** 1.5  
 **Status:** Engineering Ready  
 **Date:** February 2026
 
@@ -59,7 +59,8 @@ Intake Orchestrator — Phase 1
   ▼
 Facility Finder
   • Resolve facility_id from hints
-  • OR return facility candidates (< 0.90 confidence)
+  • OR escalate if ambiguous (< 0.90 confidence)
+  • If unresolvable after human review → UNROUTABLE (INV-12)
   │
   ▼
 Patient Finder
@@ -71,18 +72,22 @@ Patient Finder
 Communication Agent
   • Open session scoped to (facility_id, patient_id, channel)
   • Deduplicate by (facility_id, patient_id, content_hash)
-  • Classify intent (coarse-grained routing only)
+  • Classify intent (coarse-grained routing only — INV-4)
+  • Emit BrainEvent (INV-10, INV-11)
   │
-  ├─► STATUS_CHECK ──► Fast path (read-only) ──► Brain
-  ├─► CLARIFICATION ─► Attach to existing session ──► Brain
-  ├─► CANCEL ────────► Attach to existing task ──► Brain
+  ▼
+Brain (ALL paths enter here — INV-11)
   │
-  └─► NEW_REQUEST / CALLBACK
+  ├─► FAST mode (STATUS_CHECK, CLARIFICATION, CANCEL)
+  │     • Read-only (INV-7)
+  │     • CANCEL follows resolution rules (INV-14)
+  │
+  └─► EXECUTE mode (NEW_REQUEST, CALLBACK)
         │
         ▼
       Intake Orchestrator — Phase 2
         • Full entity extraction (LLM)
-        • May emit multiple INTAKE_REQUEST records under same session
+        • May emit multiple INTAKE_REQUEST records (max 5 — INV-9)
         │
         ▼
       Brain ──► Action Synthesizer ──► Smart Triage ──► Task Enforcer
@@ -129,6 +134,8 @@ All sessions and tasks are scoped to `(facility_id, patient_id)` even if facilit
 ### INV-6: Global Retry Limit
 Brain enforces a global max retry count of **3** per agent per request. After 3 REJECTs, escalate to human. No silent infinite loops.
 
+Retry counter is per agent, per request, **monotonic** and does not reset across upstream changes — except for patient re-keying (INV-2).
+
 ### INV-7: Fast Paths Are Read-Only
 Fast paths (STATUS_CHECK, CLARIFICATION, CANCEL) must not create or mutate tasks, sessions, or entities. They are read-only operations that attach to existing records.
 
@@ -137,6 +144,43 @@ Concierge is not a clinical or execution system of record. It owns orchestration
 
 ### INV-9: Phase 2 May Emit Multiple Requests
 Intake Phase 2 may emit multiple `INTAKE_REQUEST` records under the same session when a single message contains multiple distinct requests.
+
+**Guardrail:** Maximum **5 requests per message**. Above threshold → human review before split.
+
+### INV-10: Communication Agent is Stateful, Not Decision-Making
+Communication Agent is stateful but non-decision-making. It may route, never sequence downstream execution. It emits events; Brain decides next step — even for fast paths.
+
+### INV-11: Brain Has One Entry Contract
+All agents enter Brain via a single `BrainEvent` envelope:
+
+```
+BrainEvent {
+  session_id: uuid
+  request_id: uuid?          // null for session-level events
+  intent: enum
+  source_agent: string
+  mode: FAST | EXECUTE | RESUME
+  payload: json
+}
+```
+
+This prevents ad-hoc Brain entry payloads.
+
+### INV-12: Unresolvable Facility → UNROUTABLE
+If facility cannot be resolved after human review, session is closed as `UNROUTABLE` and sender is notified. No dead-end states.
+
+### INV-13: SLA Ownership
+SLA rules are **resolved by Smart Triage** but **enforced by Task Enforcer**.
+
+### INV-14: CANCEL Resolution Rules
+CANCEL intent follows explicit resolution:
+
+| Condition | Behavior |
+|-----------|----------|
+| Single active task | Cancel task |
+| Multiple active tasks | Require clarification or human |
+| Task already completed | No-op + notify sender |
+| No matching task | No-op + notify sender |
 
 ---
 
@@ -147,7 +191,7 @@ Intake Phase 2 may emit multiple `INTAKE_REQUEST` records under the same session
 | Handle fax + voice intake | **Intake Orchestrator** | OCR, ASR, normalize, extract hints (Phase 1), full entity extraction (Phase 2) | Classify intent, resolve identity, hold session state |
 | Identify which facility | **Facility Finder** | Resolve facility_id from hints; return verified ID or candidates | Hold session state, resolve patient identity |
 | Identify which patient | **Patient Finder** | Resolve patient_id within facility; return verified ID or candidate set | Hold session state, deduplicate, classify intent |
-| Prevent duplicate requests | **Communication Agent** | Open facility+patient-scoped session; deduplicate by `(facility_id, patient_id, content_hash)`; coarse-grained intent routing; outbound notifications | Resolve identity; create tasks; domain inference |
+| Prevent duplicate requests | **Communication Agent** | Open facility+patient-scoped session; deduplicate by `(facility_id, patient_id, content_hash)`; coarse-grained intent routing (INV-4); emit BrainEvent (INV-10); outbound notifications | Resolve identity; create tasks; domain inference; sequence downstream execution |
 | Classify what's needed | **Action Synthesizer** | Extract domain + action + details (semantic classification) | Route, triage, or execute |
 | Prioritize urgency | **Smart Triage** | Apply STAT/URGENT/ROUTINE rules; determine queue assignment | Execute tasks, create tasks, deduplicate |
 | Track task SLA | **Task Enforcer** | Create task, set SLA, monitor, alert on breach | Classify urgency, deduplicate |
@@ -243,30 +287,35 @@ flowchart TB
         Session["Open Session<br/>(facility_id, patient_id, channel)"]
         Hash["Content Hash"]
         Dedup{"Duplicate?<br/>(facility + patient + hash)"}
-        Intent["Intent Classification<br/>(coarse-grained routing)"]
+        Intent["Intent Classification<br/>(coarse-grained — INV-4)"]
+        Emit["Emit BrainEvent<br/>(INV-10, INV-11)"]
         
         Session --> Hash --> Dedup
         Dedup -->|No| Intent
+        Intent --> Emit
+    end
+    
+    subgraph BrainBox["1️⃣ Brain (ALL paths)"]
+        Route{"Mode?"}
+        Fast["FAST: Read-only<br/>(INV-7)"]
+        Exec["EXECUTE: Phase 2"]
+        Route -->|FAST| Fast
+        Route -->|EXECUTE| Exec
     end
     
     Input --> Normalize
     Hints --> ResolveFac
     
     FacConf -->|"≥ 0.90"| ResolvePat
-    FacConf -->|"< 0.90"| FacAmbig["Escalate: Facility ambiguous"]
+    FacConf -->|"< 0.90"| FacAmbig["Human → Resolve or UNROUTABLE<br/>(INV-12)"]
     
     PatConf -->|"≥ 0.95"| Session
     PatConf -->|"< 0.95"| PatAmbig["Session with candidate_set<br/>(PATIENT_UNVERIFIED)"]
     PatAmbig --> Hash
     
-    Dedup -->|Yes| Attach["📎 Attach to existing<br/>session/task + log"]
+    Dedup -->|Yes| Attach["📎 Attach to existing<br/>session/task + log (INV-1)"]
     
-    Intent --> Route{"Intent"}
-    Route -->|NEW_REQUEST| Phase2["➡️ Intake Phase 2"]
-    Route -->|CALLBACK| Phase2
-    Route -->|STATUS_CHECK| Fast["⚡ Fast Path (read-only)"]
-    Route -->|CLARIFICATION| AttachSession["📎 Attach to session"]
-    Route -->|CANCEL| AttachTask["📎 Attach to task"]
+    Emit --> Route
 ```
 
 ---
@@ -317,17 +366,27 @@ flowchart TB
 
 ---
 
-### Diagram D — Intent-Based Routing Fork
+### Diagram D — Intent-Based Routing (All Paths via Brain)
 
 ```mermaid
 flowchart TB
-    Comm["9️⃣ Communication Agent"] --> Intent{"Intent<br/>(coarse-grained)"}
+    Comm["9️⃣ Communication Agent"] -->|"BrainEvent<br/>(INV-11)"| Brain["1️⃣ Brain"]
     
-    Intent -->|"NEW_REQUEST"| NewPath["Full Pipeline → Creates Task"]
-    Intent -->|"CALLBACK"| CallbackPath["Full Pipeline → Creates Callback Task"]
-    Intent -->|"STATUS_CHECK"| StatusPath["Fast Path (read-only):<br/>Lookup task → Return status"]
-    Intent -->|"CLARIFICATION"| ClarifyPath["Attach to session (read-only)"]
-    Intent -->|"CANCEL"| CancelPath["Attach to task → Mark CANCELLED"]
+    Brain --> Mode{"Mode?"}
+    
+    Mode -->|"FAST"| FastPath
+    Mode -->|"EXECUTE"| ExecPath
+    
+    subgraph FastPath["FAST Mode (read-only — INV-7)"]
+        Status["STATUS_CHECK<br/>Lookup → Return status"]
+        Clarify["CLARIFICATION<br/>Attach to session"]
+        Cancel["CANCEL<br/>Resolution rules (INV-14)"]
+    end
+    
+    subgraph ExecPath["EXECUTE Mode"]
+        New["NEW_REQUEST<br/>Phase 2 → Full pipeline"]
+        Callback["CALLBACK<br/>Phase 2 → Callback task"]
+    end
 ```
 
 ---
@@ -877,9 +936,9 @@ sequenceDiagram
 | Intake (Phase 1) | Facility Finder | `{text, facility_hints}` |
 | Facility Finder | Patient Finder | `{facility_id, text, patient_hints}` |
 | Patient Finder | Communication Agent | `{facility_id, patient_id, confidence}` or `{facility_id, candidates}` |
-| Communication Agent | Intake (Phase 2) | `{session_id}` (if NEW_REQUEST/CALLBACK) |
-| Communication Agent | Brain | `{session_id, intent}` (if fast path) |
-| Intake (Phase 2) | Brain | `{session_id, request_ids[], entities[]}` |
+| Communication Agent | **Brain** | `BrainEvent {session_id, request_id?, intent, source_agent, mode, payload}` (INV-11) |
+| Brain | Intake (Phase 2) | `{session_id}` (if EXECUTE mode) |
+| Intake (Phase 2) | Brain | `BrainEvent {mode: RESUME, request_ids[], entities[]}` |
 | Brain | Action Synthesizer | `{text, session_id, request_id}` |
 | Action Synthesizer | Quality Police | `{domain, action, confidence}` |
 | Brain | Smart Triage | `{classification}` |
@@ -888,6 +947,7 @@ sequenceDiagram
 | Task Enforcer | Quality Police | `{task_id, sla}` |
 | Quality Police | Brain | `{verdict}` |
 | Brain | Human Fallback | `{escalation_context, retry_count}` |
+| Human Fallback | Brain | `BrainEvent {mode: RESUME, resolution}` |
 
 ---
 
@@ -1059,20 +1119,26 @@ erDiagram
 |------------|-------------|
 | `FACILITY_RESOLVED` | Facility Finder matched |
 | `FACILITY_AMBIGUOUS` | Facility Finder returned candidates |
+| `FACILITY_UNROUTABLE` | Facility unresolvable after human review (INV-12) |
 | `IDENTITY_RESOLVED` | Patient Finder matched |
 | `IDENTITY_AMBIGUOUS` | Patient Finder returned candidates |
 | `SESSION_OPENED` | Session created |
 | `SESSION_REKEYED` | Session re-keyed after human resolution (INV-2) |
+| `SESSION_CLOSED_UNROUTABLE` | Session closed, facility unresolvable (INV-12) |
 | `DUPLICATE_ATTACHED` | Dedup attached to existing (INV-1) |
 | `INTENT_CLASSIFIED` | Coarse intent determined |
+| `BRAIN_EVENT_RECEIVED` | Brain received BrainEvent (INV-11) |
 | `PHASE2_COMPLETED` | Entity extraction done |
 | `MULTI_REQUEST_SPLIT` | Multiple requests detected (INV-9) |
+| `MULTI_REQUEST_LIMIT_EXCEEDED` | > 5 requests, human review (INV-9) |
 | `DOMAIN_CLASSIFIED` | Action Synthesizer output |
 | `QP_VALIDATION` | Quality Police verdict |
 | `TRIAGE_COMPLETED` | Smart Triage output |
-| `TASK_TRIGGERED` | Task creation triggered |
+| `TASK_CREATED` | Task created by Task Enforcer |
 | `RETRY_ATTEMPTED` | Retry occurred (INV-6) |
 | `HANDOFF_INITIATED` | AI exited |
+| `CANCEL_RESOLVED` | CANCEL intent processed (INV-14) |
+| `CANCEL_NOOP` | CANCEL no-op (task completed/not found) |
 
 ---
 
@@ -1148,10 +1214,16 @@ INTAKE_SESSION
 |----------|----------------|----------|-------------|
 | Duplicate | `(facility, patient, hash)` exists | Attach to existing (INV-1) | N/A |
 | STATUS_CHECK | Intent match | Read-only fast path (INV-7) | N/A |
+| CLARIFICATION | Intent match | Read-only attach (INV-7) | N/A |
+| CANCEL (single task) | Intent match + 1 active task | Cancel task (INV-14) | N/A |
+| CANCEL (multiple tasks) | Intent match + >1 active task | Human clarification (INV-14) | N/A |
+| CANCEL (completed/none) | Intent match + no active task | No-op + notify (INV-14) | N/A |
 | NEEDS_REVIEW | Confidence 0.70–0.85 | AI → Human | No |
 | REJECT × 3 | Max retries (INV-6) | AI → Human | ❌ Never |
 | Patient Ambiguous | Top < 0.95 | AI → Human → AI | ✅ (re-key INV-2) |
 | Facility Ambiguous | Top < 0.90 | AI → Human | ✅ (then patient) |
+| Facility Unresolvable | Human cannot resolve | UNROUTABLE + notify (INV-12) | ❌ Closed |
+| Multi-Request Limit | > 5 requests (INV-9) | Human review before split | ✅ After review |
 | SLA Breach | Deadline passed | Escalation chain | N/A |
 
 ---
@@ -1160,17 +1232,17 @@ INTAKE_SESSION
 
 | Agent | Responsibility | Validated by QP? |
 |-------|----------------|------------------|
-| **Intake Orchestrator** | Text extraction, hints, entity extraction | No |
-| **Facility Finder** | Facility resolution | Yes |
+| **Intake Orchestrator** | Text extraction, hints, entity extraction, multi-request split (max 5 — INV-9) | No |
+| **Facility Finder** | Facility resolution; UNROUTABLE if unresolvable (INV-12) | Yes |
 | **Patient Finder** | Patient resolution (within facility) | Yes |
-| **Communication Agent** | Session, dedup, coarse intent, outbound messaging | No |
-| **Brain** | Orchestration, dispatch, retry enforcement (INV-6) | No |
+| **Communication Agent** | Session, dedup, coarse intent (INV-4), emit BrainEvent (INV-10), outbound messaging | No |
+| **Brain** | Orchestration, dispatch, retry enforcement (INV-6), mode routing (INV-11), CANCEL resolution (INV-14) | No |
 | **Action Synthesizer** | Domain + action classification (semantic) | Yes |
-| **Smart Triage** | Urgency + queue assignment | Yes |
-| **Task Enforcer** | Task lifecycle, SLA | Yes |
+| **Smart Triage** | Urgency + queue assignment; SLA rule resolution (INV-13) | Yes |
+| **Task Enforcer** | Task lifecycle, SLA enforcement (INV-13) | Yes |
 | **Quality Police** | Validation, veto power | — |
 | **Human Fallback** | Escalation packaging | No |
 
 ---
 
-*AllCare.ai Concierge — Product ↔ Technology Architecture v1.4*
+*AllCare.ai Concierge — Product ↔ Technology Architecture v1.5*
